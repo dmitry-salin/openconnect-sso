@@ -1,3 +1,4 @@
+import os
 import attr
 import requests
 import structlog
@@ -10,12 +11,13 @@ logger = structlog.get_logger()
 
 
 class Authenticator:
-    def __init__(self, host, proxy=None, credentials=None, version=None):
+    def __init__(self, host, proxy=None, credentials=None, version=None, hostscan_data=None):
         self.host = host
         self.proxy = proxy
         self.credentials = credentials
         self.version = version
         self.session = create_http_session(proxy, version)
+        self.hostscan_data = hostscan_data
 
     async def authenticate(self, display_mode):
         self._detect_authentication_target_url()
@@ -36,11 +38,17 @@ class Authenticator:
             )
             raise AuthenticationError(response)
 
+        if response.client_cert_request:
+            response = self._start_authentication(True)
+
         auth_request_response = response
 
         sso_token = await self._authenticate_in_browser(
             auth_request_response, display_mode
         )
+
+        if auth_request_response.host_scan_token:
+            self._complete_csd(auth_request_response)
 
         response = self._complete_authentication(auth_request_response, sso_token)
         if not isinstance(response, AuthCompleteResponse):
@@ -60,8 +68,8 @@ class Authenticator:
         self.host.address = response.url
         logger.debug("Auth target url", url=self.host.vpn_url)
 
-    def _start_authentication(self):
-        request = _create_auth_init_request(self.host, self.host.vpn_url, self.version)
+    def _start_authentication(self, cert_failed=False):
+        request = _create_auth_init_request(self.host, self.host.vpn_url, self.version, cert_failed)
         logger.debug("Sending auth init request", content=request)
         response = self.session.post(self.host.vpn_url, request)
         logger.debug("Auth init response received", content=response.content)
@@ -71,6 +79,15 @@ class Authenticator:
         return await authenticate_in_browser(
             self.proxy, auth_request_response, self.credentials, display_mode
         )
+
+    def _complete_csd(self, auth_request_response):
+        request = open(os.path.expanduser(self.hostscan_data)).read()
+        logger.debug("Sending CSD request", content=request)
+        self.session.cookies.set("sdesktop", auth_request_response.host_scan_token)
+        response = self.session.post(
+            self.host.vpn_url + "+CSCOE+/sdesktop/scan.xml?reusebrowser=1", request
+        )
+        logger.debug("CSD response received", content=response.content)
 
     def _complete_authentication(self, auth_request_response, sso_token):
         request = _create_auth_finish_request(
@@ -111,7 +128,7 @@ def create_http_session(proxy, version):
 E = objectify.ElementMaker(annotate=False)
 
 
-def _create_auth_init_request(host, url, version):
+def _create_auth_init_request(host, url, version, cert_failed):
     ConfigAuth = getattr(E, "config-auth")
     Version = E.version
     DeviceId = getattr(E, "device-id")
@@ -119,15 +136,20 @@ def _create_auth_init_request(host, url, version):
     GroupAccess = getattr(E, "group-access")
     Capabilities = E.capabilities
     AuthMethod = getattr(E, "auth-method")
+    ClientCertFail = getattr(E, "client-cert-fail")
 
-    root = ConfigAuth(
-        {"client": "vpn", "type": "init", "aggregate-auth-version": "2"},
+    params = [{"client": "vpn", "type": "init", "aggregate-auth-version": "2"},
         Version({"who": "vpn"}, version),
         DeviceId("linux-64"),
         GroupSelect(host.name),
         GroupAccess(url),
-        Capabilities(AuthMethod("single-sign-on-v2")),
-    )
+        Capabilities(AuthMethod("single-sign-on-v2"))
+    ]
+    if cert_failed:
+        params.append(ClientCertFail(""))
+
+    root = ConfigAuth(*params)
+
     return etree.tostring(
         root, pretty_print=True, xml_declaration=True, encoding="UTF-8"
     )
@@ -144,19 +166,33 @@ def parse_response(resp):
 
 
 def parse_auth_request_response(xml):
+    if hasattr(xml, "client-cert-request"):
+        return AuthRequestResponse(client_cert_request=True)
+
     assert xml.auth.get("id") == "main"
 
     try:
-        resp = AuthRequestResponse(
-            auth_id=xml.auth.get("id"),
-            auth_title=getattr(xml.auth, "title", ""),
-            auth_message=xml.auth.message,
-            auth_error=getattr(xml.auth, "error", ""),
-            opaque=xml.opaque,
-            login_url=xml.auth["sso-v2-login"],
-            login_final_url=xml.auth["sso-v2-login-final"],
-            token_cookie_name=xml.auth["sso-v2-token-cookie-name"],
-        )
+        args = {"auth_id": xml.auth.get("id"),
+            "auth_title": getattr(xml.auth, "title", ""),
+            "auth_message": xml.auth.message,
+            "auth_error": getattr(xml.auth, "error", ""),
+            "login_url": xml.auth["sso-v2-login"],
+            "login_final_url": xml.auth["sso-v2-login-final"],
+            "token_cookie_name": xml.auth["sso-v2-token-cookie-name"],
+            "opaque": xml.opaque,
+            "client_cert_request": False
+        }
+
+        if hasattr(xml, "host-scan"):
+            scan_args = {"host_scan_ticket": xml["host-scan"]["host-scan-ticket"],
+                "host_scan_token": xml["host-scan"]["host-scan-token"],
+                "host_scan_base_url": xml["host-scan"]["host-scan-base-uri"],
+                "host_scan_wait_url": xml["host-scan"]["host-scan-wait-uri"]
+            }
+            args = args | scan_args
+
+        resp = AuthRequestResponse(**args)
+
     except AttributeError as exc:
         raise AuthResponseError(exc)
 
@@ -171,14 +207,19 @@ def parse_auth_request_response(xml):
 
 @attr.s
 class AuthRequestResponse:
-    auth_id = attr.ib(converter=str)
-    auth_title = attr.ib(converter=str)
-    auth_message = attr.ib(converter=str)
-    auth_error = attr.ib(converter=str)
-    login_url = attr.ib(converter=str)
-    login_final_url = attr.ib(converter=str)
-    token_cookie_name = attr.ib(converter=str)
-    opaque = attr.ib()
+    auth_id = attr.ib(converter=str, default="")
+    auth_title = attr.ib(converter=str, default="")
+    auth_message = attr.ib(converter=str, default="")
+    auth_error = attr.ib(converter=str, default="")
+    login_url = attr.ib(converter=str, default="")
+    login_final_url = attr.ib(converter=str, default="")
+    token_cookie_name = attr.ib(converter=str, default="")
+    host_scan_ticket = attr.ib(converter=str, default="")
+    host_scan_token = attr.ib(converter=str, default="")
+    host_scan_base_url = attr.ib(converter=str, default="")
+    host_scan_wait_url = attr.ib(converter=str, default="")
+    opaque = attr.ib(default=False)
+    client_cert_request = attr.ib(default=False)
 
 
 def parse_auth_complete_response(xml):
@@ -209,16 +250,21 @@ def _create_auth_finish_request(host, auth_info, sso_token, version):
     SessionId = getattr(E, "session-id")
     Auth = E.auth
     SsoToken = getattr(E, "sso-token")
+    HostScanToken = getattr(E, "host-scan-token")
 
-    root = ConfigAuth(
-        {"client": "vpn", "type": "auth-reply", "aggregate-auth-version": "2"},
+    params = [{"client": "vpn", "type": "auth-reply", "aggregate-auth-version": "2"},
         Version({"who": "vpn"}, version),
         DeviceId("linux-64"),
         SessionToken(),
         SessionId(),
         auth_info.opaque,
-        Auth(SsoToken(sso_token)),
-    )
+        Auth(SsoToken(sso_token))
+    ]
+    if auth_info.host_scan_token:
+        params.append(HostScanToken(auth_info.host_scan_token))
+
+    root = ConfigAuth(*params)
+
     return etree.tostring(
         root, pretty_print=True, xml_declaration=True, encoding="UTF-8"
     )

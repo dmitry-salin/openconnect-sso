@@ -42,6 +42,12 @@ def create_argparser():
         "https://vpn.server.com, https.vpn.server.com.usergroup",
     )
 
+    server_settings.add_argument(
+        "--hostscan-data",
+        help="Path to file with hostscan data for CSD",
+        default="hostscan-data",
+    )
+
     auth_settings = parser.add_argument_group(
         "Authentication",
         "Used for the same purpose as in OpenConnect. Refer to OpenConnect's documentation for further information",
